@@ -22,11 +22,12 @@ class MediaGraph:
         >>> from jellyfin_apiclient_python.media_graph import MediaGraph
         >>> import ubelt as ub
         >>> # Given an API client
-        >>> MediaGraph.ensure_demo_server(reset=0)
+        >>> #MediaGraph.ensure_demo_server(reset=0)
         >>> client = MediaGraph.demo_client()
         >>> # Create the media graph by passing it the client
         >>> self = MediaGraph(client)
         >>> self.walk_config['initial_depth'] = None
+        >>> self._DEBUG =1
         >>> self.setup()
         ...
         >>> # Print the graph at the top level
@@ -151,20 +152,19 @@ class MediaGraph:
         return result_box.get('result', None)
 
 
-    def ensure_demo_server(cls, reset=False):
+    @classmethod
+    def ensure_demo_server(cls, reset: bool = False):
         """
-        We want to ensure we have a demo server to play with.  We can do this
-        with a docker image.
+        Ensure we have a demo Jellyfin server running for interactive use or tests.
 
-        Requires docker.
-
-        References:
-            https://jellyfin.org/docs/general/installation/container#docker
-            https://commons.wikimedia.org/wiki/Category:Audio_files
+        - If reset=True, destroy any previous container and start fresh.
+        - Otherwise reuse an existing container for speed.
         """
-        from jellyfin_apiclient_python.demo.demo_jellyfin_server import DemoJellyfinServerManager
-        demoman = DemoJellyfinServerManager()
-        demoman.ensure_server(reset=reset)
+        from jellyfin_apiclient_python.demo import JellyfinDockerServer
+        server = JellyfinDockerServer(reuse_container=not reset)
+        server.start()
+        cls._demo_server = server
+        return server
 
     @classmethod
     def demo_client(cls):
@@ -176,13 +176,9 @@ class MediaGraph:
         """
         # TODO: Ensure test environment can spin up a dummy jellyfin server.
         from jellyfin_apiclient_python.openapi.client import Jellyfin
-        url = 'http://127.0.0.1:8097'
-        username = 'jellyfin'
-        password = 'jellyfin'
-
-        url="http://192.168.222.38:8096"
-        username="jellyfin"
-        password=""
+        url = 'http://127.0.1.1:34907'
+        username = 'jellyfin-user'
+        password = 'jellyfin-pass'
 
         client = Jellyfin(
             base_url=url,
@@ -253,7 +249,8 @@ class MediaGraph:
         assert resp.status_code == 200
         data = resp.parsed.to_dict()
 
-        graph = self.graph
+        graph = nx.DiGraph()
+        self.graph = graph
         for item in data['Items']:
             if item['Id'] not in graph:
                 graph.add_node(item['Id'], item=item, properties=dict(expanded=False))
@@ -274,16 +271,17 @@ class MediaGraph:
 
         initial_depth = self.walk_config['initial_depth']
 
-        pman = ub.ProgressManager()
-        stats = ub.ddict(lambda: 0)
-        stats['node_types'] = ub.ddict(lambda: 0)
-        stats['edge_types'] = ub.ddict(lambda: 0)
-        stats['nondag_edge_types'] = ub.ddict(lambda: 0)
+        pman = progiter.ProgressManager()
+        with pman:
+            stats = ub.ddict(lambda: 0)
+            stats['node_types'] = ub.ddict(lambda: 0)
+            stats['edge_types'] = ub.ddict(lambda: 0)
+            stats['nondag_edge_types'] = ub.ddict(lambda: 0)
 
-        # Expand each media root
-        for root_id in pman.progiter(root_node_ids, desc='Initialize Media Root', verbose=3):
-            item = graph.nodes[root_id]['item']
-            await self._walk_node_async(item, pman, stats, max_depth=initial_depth)
+            # Expand each media root
+            for root_id in pman.progiter(root_node_ids, desc='Initialize Media Root', verbose=3):
+                item = graph.nodes[root_id]['item']
+                await self._walk_node_async(item, pman, stats, max_depth=initial_depth)
 
         return stats
 
@@ -503,7 +501,7 @@ class MediaGraph:
         last_err = None
         for attempt in range(1, attempts + 1):
             try:
-                # TODO: replace REST call with
+                # Using new sync client.
                 resp = client.api.items.get_items.sync_detailed(
                     parent_id=parent_id, user_id=client.user_id,
                     recursive=False, fields=fields, limit=perquery_limit,
