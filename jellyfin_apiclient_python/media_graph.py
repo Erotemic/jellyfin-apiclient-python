@@ -1,3 +1,21 @@
+"""
+Async Jellyfin media graph crawler with "filesystem-like" navigation.
+
+Key goals:
+- Keep the *exact* same NetworkX graph labeling logic as before (see _update_graph_labels).
+- Allow "browse" behavior: only crawl top-level media folders initially, then expand folders on demand.
+- Make async walking robust (no deadlocks) and more debuggable.
+
+Notable fixes / changes vs the previous async version:
+- **Fixed deadlock**: workers no longer `return` when they encounter a duplicate; they `continue`.
+- **Fixed browse regression**: previously a shallow initial crawl could mark nodes as "started" and
+  prevent later expansion. Now we track in-flight expansions separately and only de-dup on the
+  node's `properties['expanded']` flag.
+- Improved structure: isolated concurrency / de-dup logic and added optional debug tracing.
+
+The rich label strings and how they're computed are intentionally unchanged.
+"""
+
 import typing
 import rich
 import ubelt as ub
@@ -26,6 +44,7 @@ class MediaGraph:
         >>> client = MediaGraph.demo_client()
         >>> client._authed = client._authed.with_timeout(90)
         >>> # Create the media graph by passing it the client
+        >>> from jellyfin_apiclient_python.media_graph import MediaGraph
         >>> self = MediaGraph(client)
         >>> self.walk_config['initial_depth'] = None
         >>> self.walk_config['perquery_limit'] = 100
@@ -92,19 +111,32 @@ class MediaGraph:
             'MediaType': 'Audio',
         }
     """
+
     def __init__(self, client):
         self.client = client
         self.graph = None
         self.walk_config = {
+            # "browse mode" default: only add top-level folders on setup
+            # - None means crawl everything recursively
+            # - 0 means only initialize root nodes (no children)
+            # - 1 means root + direct children, etc...
             'initial_depth': 0,
             'include_collection_types': None,
             'exclude_collection_types': None,
             'perquery_limit': 100,
             'query_attempts': 1,
+
             # Async / concurrency knobs
             'max_concurrent_requests': 20,
             'max_concurrent_parents': 10,
+            'max_concurrent_root_walks': 3,
             'page_prefetch': True,
+
+            # Only show per-folder progress bars when the folder is big (except roots)
+            'min_progress_total': 200,
+
+            # Periodic info panel update interval (seconds)
+            'info_update_interval': 1.0,
         }
         self.display_config = {
             'show_path': False,
@@ -114,10 +146,12 @@ class MediaGraph:
         self._media_root_nodes = None
         self._DEBUG = False
 
+        # In-flight expansion de-dup across concurrent walks / open_node calls.
+        # IMPORTANT: This is distinct from "expanded"; it only prevents multiple
+        # concurrent expansions of the same node. Nodes can be expanded later.
+        self._inflight = set()
+        self._inflight_lock = None  # asyncio.Lock, initialized lazily
 
-        # Tracks nodes that have begun expansion across concurrent walks
-        self._walk_started = set()
-        self._walk_started_lock = None  # initialized lazily in async context
         # NOTE: It might not be a great idea to collect all fields by default
         # Things like CumulativeRunTimeTicks might require aggregation
         from jellyfin_apiclient_python.openapi._generated.models.item_fields import ItemFields
@@ -128,6 +162,10 @@ class MediaGraph:
             ItemFields.PEOPLE,
         }
         self.fields = [ItemFields.PATH, ItemFields.GENRES, ItemFields.PARENTID]
+
+    def _dbg(self, msg: str):
+        if self._DEBUG:
+            print(f'[MediaGraph] {msg}')
 
     @classmethod
     def _run_async(self, coro):
@@ -163,7 +201,6 @@ class MediaGraph:
             raise error_box['error']
         return result_box.get('result', None)
 
-
     @classmethod
     def ensure_demo_server(cls, reset: bool = False):
         """
@@ -191,6 +228,10 @@ class MediaGraph:
         url = 'http://127.0.1.1:34907'
         username = 'jellyfin-user'
         password = 'jellyfin-pass'
+
+        url="http://192.168.222.38:8096"
+        username="jellyfin"
+        password=""
 
         client = Jellyfin(
             base_url=url,
@@ -235,7 +276,6 @@ class MediaGraph:
     def __truediv__(self, node):
         self.open_node(node, verbose=1)
         return self
-
 
     def setup(self):
         """Populate the initial media folder graph.
@@ -395,6 +435,9 @@ class MediaGraph:
         max_parents = int(self.walk_config.get('max_concurrent_parents', 10))
         page_prefetch = bool(self.walk_config.get('page_prefetch', True))
 
+        info_update_interval = float(self.walk_config.get('info_update_interval', 1.0))
+        min_progress_total = int(self.walk_config.get('min_progress_total', 200))
+
         sem = asyncio.Semaphore(max_req)
 
         # Adding UserViews creates duplicates, and collections can be huge / cyclic
@@ -413,15 +456,14 @@ class MediaGraph:
         for _root in (roots if isinstance(roots, (list, tuple)) else [roots]):
             await q.put(StackFrame(_root, 0, True))
 
-        timer = ub.Timer()
+        # In-flight de-dup lock (async context)
+        if self._inflight_lock is None:
+            self._inflight_lock = asyncio.Lock()
+        inflight = self._inflight
+        inflight_lock = self._inflight_lock
 
-        # Global de-duplication across concurrent walks
-        if self._walk_started_lock is None:
-            self._walk_started_lock = asyncio.Lock()
-        started = self._walk_started
-        started_lock = self._walk_started_lock
-
-        min_progress_total = int(self.walk_config.get('min_progress_total', 200))
+        # Keep the info panel responsive without flooding refresh
+        last_info_update = ub.Timer().tic()
 
         async def fetch_all_children(parent, *, is_root=False):
             """Fetch all children of a parent.
@@ -486,6 +528,7 @@ class MediaGraph:
             parent = frame.item
             parent_id = parent['Id']
 
+            # Respect max_depth without poisoning future expansions
             if max_depth is not None and frame.depth >= max_depth:
                 return
 
@@ -499,11 +542,7 @@ class MediaGraph:
 
             # Special features for Series/Season
             if parent.get('Type') in {'Series', 'Season'}:
-                try:
-                    special_features = await self._special_features_async(parent_id, sem=sem)
-                except Exception:  # nocov
-                    special_features = []
-                    raise
+                special_features = await self._special_features_async(parent_id, sem=sem)
                 if special_features:
                     special_features_id = parent_id + '/SpecialFeatures'
                     special_parent = {
@@ -527,9 +566,10 @@ class MediaGraph:
 
             for child in children_items:
                 cid = child['Id']
+
+                # Node already exists (possibly reached via another path).
+                # Still add the edge.
                 if cid in graph.nodes:
-                    # Node already exists (possibly reached via another path).
-                    # Still add the edge. Expansion is globally de-duplicated.
                     stats['nondag_edge_types'][(parent.get('Type'), child.get('Type'))] += 1
                     if not graph.has_edge(parent_id, cid):
                         graph.add_edge(parent_id, cid)
@@ -555,29 +595,50 @@ class MediaGraph:
             if pman is not None and folder_task is not None:
                 pman.remove_task(folder_task)
 
-            # Progress update
+            # Periodic info update
             if pman is not None:
-                if timer.toc() > 1.1:
+                if last_info_update.toc() > info_update_interval:
                     pman.update_info(ub.urepr(stats))
-                timer.tic()
+                    last_info_update.tic()
 
-        async def worker():
+        async def worker(worker_id: int):
             while True:
                 frame = await q.get()
+                pid = frame.item['Id']
                 try:
-                    pid = frame.item['Id']
-                    # Only one concurrent expansion per node across all roots.
-                    async with started_lock:
-                        if pid in started:
-                            return
-                        started.add(pid)
-                    await expand_parent(frame)
+                    # Fast skip if already expanded
+                    try:
+                        if graph.nodes[pid]['properties'].get('expanded', False):
+                            continue
+                    except KeyError:
+                        # Node should exist, but if not, don't crash workers
+                        continue
+
+                    # Respect max_depth early (and don't "reserve" inflight)
+                    if max_depth is not None and frame.depth >= max_depth:
+                        continue
+
+                    # In-flight de-dup: only one worker should expand a node at a time.
+                    async with inflight_lock:
+                        if pid in inflight:
+                            continue
+                        # It might have been expanded while waiting for the lock
+                        if graph.nodes[pid]['properties'].get('expanded', False):
+                            continue
+                        inflight.add(pid)
+
+                    try:
+                        await expand_parent(frame)
+                    finally:
+                        async with inflight_lock:
+                            inflight.discard(pid)
+
                 finally:
                     q.task_done()
 
         if self._DEBUG:
             print('... start async workers')
-        workers = [asyncio.create_task(worker()) for _ in range(max_parents)]
+        workers = [asyncio.create_task(worker(i)) for i in range(max_parents)]
         if self._DEBUG:
             print(f'workers={workers}')
 
@@ -587,8 +648,7 @@ class MediaGraph:
             # Always cancel workers once the queue is done (or if something errors)
             for w in workers:
                 w.cancel()
-            # IMPORTANT: await workers so any exception inside them is re-raised here
-            # (this is what makes it "bubble up" like sync code).
+            # Await workers so any exception inside them is re-raised here
             results = await asyncio.gather(*workers, return_exceptions=True)
             for r in results:
                 if isinstance(r, asyncio.CancelledError):
@@ -668,7 +728,6 @@ class MediaGraph:
                 resp = await client.api.user_library.get_special_features.asyncio_detailed(item_id=item_id)
         assert resp.status_code == 200
         return [f.to_dict() for f in resp.parsed]
-
 
     def _coerce_item_fields(self, fields):
         """
@@ -924,8 +983,6 @@ def rprint(*args):
         print(*args)
 
 
-
-
 class _RichWalkProgress:
     """Standalone rich progress + info panel for async MediaGraph walking.
 
@@ -1023,4 +1080,3 @@ class _RichWalkProgress:
             self.group.renderables.insert(0, self.info_panel)
         else:
             self.info_panel.renderable = text
-

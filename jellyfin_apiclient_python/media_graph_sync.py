@@ -24,6 +24,7 @@ class MediaGraphSync:
         >>> # Given an API client
         >>> MediaGraphSync.ensure_demo_server(reset=0)
         >>> client = MediaGraphSync.demo_client()
+        >>> client._authed = client._authed.with_timeout(90)
         >>> # Create the media graph by passing it the client
         >>> self = MediaGraphSync(client)
         >>> self.walk_config['initial_depth'] = None
@@ -111,6 +112,7 @@ class MediaGraphSync:
         # Things like CumulativeRunTimeTicks might require aggregation
         from jellyfin_apiclient_python.openapi._generated.models.item_fields import ItemFields
         self.fields = list(ItemFields)
+        self.fields = [ItemFields.PATH, ItemFields.GENRES, ItemFields.PARENTID]
 
     @classmethod
     def ensure_demo_server(cls, reset=False):
