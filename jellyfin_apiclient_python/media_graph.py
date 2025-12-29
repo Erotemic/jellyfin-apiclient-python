@@ -24,10 +24,12 @@ class MediaGraph:
         >>> # Given an API client
         >>> #MediaGraph.ensure_demo_server(reset=0)
         >>> client = MediaGraph.demo_client()
+        >>> client._authed = client._authed.with_timeout(90)
         >>> # Create the media graph by passing it the client
         >>> self = MediaGraph(client)
         >>> self.walk_config['initial_depth'] = None
-        >>> self._DEBUG = 1
+        >>> self.walk_config['perquery_limit'] = 100
+        >>> self._DEBUG = 0
         >>> self.setup()
         ...
         >>> # Print the graph at the top level
@@ -97,7 +99,7 @@ class MediaGraph:
             'initial_depth': 0,
             'include_collection_types': None,
             'exclude_collection_types': None,
-            'perquery_limit': 200,
+            'perquery_limit': 100,
             'query_attempts': 1,
             # Async / concurrency knobs
             'max_concurrent_requests': 20,
@@ -112,12 +114,20 @@ class MediaGraph:
         self._media_root_nodes = None
         self._DEBUG = False
 
+
+        # Tracks nodes that have begun expansion across concurrent walks
+        self._walk_started = set()
+        self._walk_started_lock = None  # initialized lazily in async context
         # NOTE: It might not be a great idea to collect all fields by default
         # Things like CumulativeRunTimeTicks might require aggregation
         from jellyfin_apiclient_python.openapi._generated.models.item_fields import ItemFields
         self.fields = set(ItemFields) - {
             ItemFields.CUMULATIVERUNTIMETICKS,
+            ItemFields.RECURSIVEITEMCOUNT,
+            ItemFields.LOCALTRAILERCOUNT,
+            ItemFields.PEOPLE,
         }
+        self.fields = [ItemFields.PATH, ItemFields.GENRES, ItemFields.PARENTID]
 
     @classmethod
     def _run_async(self, coro):
@@ -182,10 +192,6 @@ class MediaGraph:
         username = 'jellyfin-user'
         password = 'jellyfin-pass'
 
-        # url="http://192.168.222.38:8096"
-        # username="jellyfin"
-        # password=""
-
         client = Jellyfin(
             base_url=url,
             username=username,
@@ -230,38 +236,6 @@ class MediaGraph:
         self.open_node(node, verbose=1)
         return self
 
-    def open_node(self, node, verbose=0, max_depth=1):
-        """Synchronously expand a node in the graph."""
-        if self.graph is None:
-            raise RuntimeError('MediaGraph.graph is not initialized; call setup() first')
-
-        if isinstance(node, str):
-            node_id = node
-            node_data = self.graph.nodes[node_id]
-        elif isinstance(node, dict) and 'item' in node:
-            node_data = node
-            node_id = node_data['item']['Id']
-        else:
-            node_id = str(node)
-            node_data = self.graph.nodes[node_id]
-
-        item = node_data['item']
-
-        stats = {
-            'node_types': ub.ddict(int),
-            'edge_types': ub.ddict(int),
-            'nondag_edge_types': ub.ddict(int),
-            'total': 0,
-            'latest_name': None,
-        }
-        pman = ub.ProgIter(desc='Open Node', verbose=verbose)
-        with pman:
-            self._run_async(self._walk_node_async(item, pman, stats, max_depth=max_depth))
-        self._update_graph_labels(sources=[node_id])
-
-        if verbose:
-            self.print_graph([node])
-            self.print_item(node)
 
     def setup(self):
         """Populate the initial media folder graph.
@@ -298,7 +272,7 @@ class MediaGraph:
         }
         pman = ub.ProgIter(desc='Open Node', verbose=verbose)
         with pman:
-            self._run_async(self._walk_node_async(item, pman, stats, max_depth=max_depth))
+            self._run_async(self._walk_node_async([item], pman, stats, max_depth=max_depth))
         self._update_graph_labels(sources=[node_id])
 
         if verbose:
@@ -379,15 +353,30 @@ class MediaGraph:
         # Pre-walk each media root (optional)
         if self._DEBUG:
             print('... top level scan complete, starting media folder walk.')
-        pman = progiter.ProgressManager()
+        pman = _RichWalkProgress(enabled=True)
         with pman:
+            # Root-level progress bar (always shown, even for small roots)
+            root_task = pman.add_task('Walk Media Folders', total=len(root_items))
 
-            for item in pman.progiter(root_items, desc='Walk Media Folders', verbose=3):
-                await self._walk_node_async(item, pman, stats, max_depth=initial_depth)
+            import asyncio
+            max_roots = int(self.walk_config.get('max_concurrent_root_walks', 3))
+            root_sem = asyncio.Semaphore(max_roots)
+
+            async def _walk_one_root(item):
+                async with root_sem:
+                    await self._walk_node_async([item], pman, stats, max_depth=initial_depth)
+                # Advance after the root walk completes (successfully)
+                pman.advance(root_task, 1)
+
+            tasks = [asyncio.create_task(_walk_one_root(item)) for item in root_items]
+            # Bubble exceptions like the synchronous version: any failure aborts setup.
+            await asyncio.gather(*tasks, return_exceptions=False)
+
+            pman.remove_task(root_task)
 
         return stats
 
-    async def _walk_node_async(self, root_item, pman, stats, max_depth=None):
+    async def _walk_node_async(self, roots, pman, stats, max_depth=None):
         """Concurrent async walker that expands nodes using OpenAPI ``asyncio_detailed``.
 
         Concurrency strategy:
@@ -418,21 +407,44 @@ class MediaGraph:
         class StackFrame(typing.NamedTuple):
             item: dict
             depth: int
+            is_root: bool
 
         q: asyncio.Queue[StackFrame] = asyncio.Queue()
-        await q.put(StackFrame(root_item, 0))
+        for _root in (roots if isinstance(roots, (list, tuple)) else [roots]):
+            await q.put(StackFrame(_root, 0, True))
 
         timer = ub.Timer()
 
-        expanded = set()
+        # Global de-duplication across concurrent walks
+        if self._walk_started_lock is None:
+            self._walk_started_lock = asyncio.Lock()
+        started = self._walk_started
+        started_lock = self._walk_started_lock
 
-        async def fetch_all_children(parent):
+        min_progress_total = int(self.walk_config.get('min_progress_total', 200))
+
+        async def fetch_all_children(parent, *, is_root=False):
+            """Fetch all children of a parent.
+
+            Progress behavior:
+                * Always show a progress bar for root media folders.
+                * For non-root folders, only show a bar if TotalRecordCount is large
+                  (>= ``min_progress_total``).
+            """
+            parent_name = parent.get('Name', '<no-name>')
+            folder_task = None
+
             first = await self._safe_user_items_async(
                 parent=parent, offset=0, perquery_limit=perquery_limit,
                 fields=fields, attempts=attempts, sem=sem,
             )
             items = list(first.get('Items', []))
             total = first.get('TotalRecordCount', len(items))
+
+            if pman is not None and (is_root or total >= min_progress_total):
+                folder_task = pman.add_task(f'Walk {parent_name}', total=total)
+                if items:
+                    pman.advance(folder_task, len(items))
 
             if not page_prefetch:
                 offset = len(items)
@@ -441,11 +453,14 @@ class MediaGraph:
                         parent=parent, offset=offset, perquery_limit=perquery_limit,
                         fields=fields, attempts=attempts, sem=sem,
                     )
-                    items.extend(page.get('Items', []))
-                    offset += len(page.get('Items', []))
-                return items
+                    page_items = page.get('Items', [])
+                    items.extend(page_items)
+                    offset += len(page_items)
+                    if pman is not None and folder_task is not None and page_items:
+                        pman.advance(folder_task, len(page_items))
+                return items, total, folder_task
 
-            # Fetch remaining pages concurrently
+            # Fetch remaining pages concurrently and advance as they complete
             tasks = []
             offset = len(items)
             while offset < total:
@@ -458,10 +473,14 @@ class MediaGraph:
                 offset += perquery_limit
 
             if tasks:
-                pages = await asyncio.gather(*tasks)
-                for page in pages:
-                    items.extend(page.get('Items', []))
-            return items
+                for fut in asyncio.as_completed(tasks):
+                    page = await fut
+                    page_items = page.get('Items', [])
+                    items.extend(page_items)
+                    if pman is not None and folder_task is not None and page_items:
+                        pman.advance(folder_task, len(page_items))
+
+            return items, total, folder_task
 
         async def expand_parent(frame: StackFrame):
             parent = frame.item
@@ -472,10 +491,11 @@ class MediaGraph:
 
             node_data = graph.nodes[parent_id]
             node_data['properties']['expanded'] = True
-            expanded.add(parent_id)
 
             stats['latest_name'] = parent.get('Name', None)
             stats['latest_path'] = parent.get('Path', None)
+
+            folder_task = None
 
             # Special features for Series/Season
             if parent.get('Type') in {'Series', 'Season'}:
@@ -503,12 +523,18 @@ class MediaGraph:
                         if not graph.has_edge(special_parent['Id'], special['Id']):
                             graph.add_edge(special_parent['Id'], special['Id'])
 
-            children_items = await fetch_all_children(parent)
+            children_items, _total, folder_task = await fetch_all_children(parent, is_root=frame.is_root)
 
             for child in children_items:
                 cid = child['Id']
                 if cid in graph.nodes:
+                    # Node already exists (possibly reached via another path).
+                    # Still add the edge. Expansion is globally de-duplicated.
                     stats['nondag_edge_types'][(parent.get('Type'), child.get('Type'))] += 1
+                    if not graph.has_edge(parent_id, cid):
+                        graph.add_edge(parent_id, cid)
+                    if child.get('IsFolder') and child.get('Type') not in type_recurse_blocklist:
+                        await q.put(StackFrame(child, frame.depth + 1, False))
                     continue
 
                 if child.get('Type') in type_add_blocklist:
@@ -522,9 +548,12 @@ class MediaGraph:
 
                 # Queue child folders for expansion
                 if child.get('IsFolder') and child.get('Type') not in type_recurse_blocklist:
-                    await q.put(StackFrame(child, frame.depth + 1))
+                    await q.put(StackFrame(child, frame.depth + 1, False))
 
             stats['total'] += len(children_items)
+
+            if pman is not None and folder_task is not None:
+                pman.remove_task(folder_task)
 
             # Progress update
             if pman is not None:
@@ -537,8 +566,11 @@ class MediaGraph:
                 frame = await q.get()
                 try:
                     pid = frame.item['Id']
-                    if pid in expanded:
-                        continue
+                    # Only one concurrent expansion per node across all roots.
+                    async with started_lock:
+                        if pid in started:
+                            return
+                        started.add(pid)
                     await expand_parent(frame)
                 finally:
                     q.task_done()
@@ -890,3 +922,105 @@ def rprint(*args):
         rich.print(*args)
     except ImportError:
         print(*args)
+
+
+
+
+class _RichWalkProgress:
+    """Standalone rich progress + info panel for async MediaGraph walking.
+
+    Designed to resemble progiter.manager rich backend style, but without
+    progiter, so async code can directly manage per-node tasks.
+    """
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self._active = False
+        self.info_panel = None
+        self.progress = None
+        self.live = None
+        self.group = None
+        self._setup()
+
+    def _setup(self):
+        from rich.console import Group
+        from rich.live import Live
+        from rich.panel import Panel
+        from rich.progress import Progress as RichProgress
+        from rich.progress import BarColumn, TextColumn, SpinnerColumn, ProgressColumn, Text
+        import rich.progress as rich_progress
+
+        class ProgressRateColumn(ProgressColumn):
+            """Shows iterations / second."""
+            def render(self, task) -> Text:
+                itps = task.finished_speed or task.speed
+                if itps is not None:
+                    rate_format = '4.2f' if itps > .001 else 'g'
+                    text = ('{:' + rate_format + '} Hz').format(itps)
+                else:
+                    text = '?'
+                return Text(text, style='progress.data.speed')
+
+        self._Panel = Panel
+
+        self.progress = RichProgress(
+            TextColumn("{task.description}"),
+            SpinnerColumn(),
+            BarColumn(),
+            "[progress.percentage]{task.percentage:>3.0f}%",
+            rich_progress.MofNCompleteColumn(),
+            ProgressRateColumn(),
+            'eta',
+            rich_progress.TimeRemainingColumn(),
+            'total',
+            rich_progress.TimeElapsedColumn(),
+        )
+        self.info_panel = None
+        self.group = Group(self.progress)
+        self.live = Live(self.group)
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type=None, exc_val=None, exc_tb=None):
+        self.stop(exc_type=exc_type, exc_val=exc_val, exc_tb=exc_tb)
+
+    def start(self):
+        if self.enabled and not self._active:
+            self._active = True
+            self.live.__enter__()
+
+    def stop(self, **kw):
+        if self.enabled and self._active:
+            if not kw:
+                kw = {'exc_type': None, 'exc_val': None, 'exc_tb': None}
+            self.live.__exit__(**kw)
+            self._active = False
+
+    def add_task(self, desc, total=None):
+        if not self.enabled:
+            return None
+        return self.progress.add_task(description=desc, total=total)
+
+    def update(self, task_id, **kw):
+        if self.enabled and task_id is not None:
+            self.progress.update(task_id, **kw)
+
+    def advance(self, task_id, n=1):
+        if self.enabled and task_id is not None:
+            self.progress.update(task_id, advance=n)
+
+    def remove_task(self, task_id):
+        if self.enabled and task_id is not None:
+            self.progress.remove_task(task_id)
+
+    def update_info(self, text):
+        if not self.enabled:
+            return
+        if self.info_panel is None:
+            self.info_panel = self._Panel(text)
+            # Insert above progress bars
+            self.group.renderables.insert(0, self.info_panel)
+        else:
+            self.info_panel.renderable = text
+
