@@ -1,26 +1,29 @@
 """
 Async Jellyfin media graph crawler with "filesystem-like" navigation.
 
-Key goals:
-- Keep the *exact* same NetworkX graph labeling logic as before (see _update_graph_labels).
-- Allow "browse" behavior: only crawl top-level media folders initially, then expand folders on demand.
-- Make async walking robust (no deadlocks) and more debuggable.
+Progress semantics (subtree-completion model, DAG-safe):
+- Persistent top-level bar: one unit per top-level media folder; advances ONLY when that folder's
+  entire subtree (within max_depth) is finished.
+- Transient per-top-level-folder bar: total = TotalRecordCount for that folder; advances by 1
+  for each DIRECT child in that listing when that direct child is "complete":
+    * leaf child => complete immediately when discovered
+    * folder child => complete when its subtree is finished IF this parent is the child's "primary"
+      parent; otherwise complete immediately (prevents hangs in DAG situations)
+  Removed when the top-level folder completes.
+- Optional transient "large folder" bars for subfolders with many direct children (>= threshold):
+  same semantics; removed when folder completes.
 
-Notable fixes / changes vs the previous async version:
-- **Fixed deadlock**: workers no longer `return` when they encounter a duplicate; they `continue`.
-- **Fixed browse regression**: previously a shallow initial crawl could mark nodes as "started" and
-  prevent later expansion. Now we track in-flight expansions separately and only de-dup on the
-  node's `properties['expanded']` flag.
-- Improved structure: isolated concurrency / de-dup logic and added optional debug tracing.
-
-The rich label strings and how they're computed are intentionally unchanged.
+Important invariants:
+- The NetworkX DiGraph is used.
+- The rich label strings and how they are computed are unchanged (see _update_graph_labels).
+- Graph construction details may vary, but "browse" is supported: setup defaults to only listing
+  top-level folders; user can expand each individually via open_node/cd.
 """
 
 import typing
 import rich
 import ubelt as ub
 import networkx as nx
-import progiter
 
 
 class MediaGraph:
@@ -111,15 +114,12 @@ class MediaGraph:
             'MediaType': 'Audio',
         }
     """
-
     def __init__(self, client):
         self.client = client
         self.graph = None
         self.walk_config = {
-            # "browse mode" default: only add top-level folders on setup
-            # - None means crawl everything recursively
-            # - 0 means only initialize root nodes (no children)
-            # - 1 means root + direct children, etc...
+            # Browse mode default: only initialize top-level roots on setup.
+            # None => crawl everything recursively.
             'initial_depth': 0,
             'include_collection_types': None,
             'exclude_collection_types': None,
@@ -132,11 +132,12 @@ class MediaGraph:
             'max_concurrent_root_walks': 3,
             'page_prefetch': True,
 
-            # Only show per-folder progress bars when the folder is big (except roots)
-            'min_progress_total': 200,
+            # Progress behavior
+            'info_update_interval': 0.5,
+            'large_folder_threshold': 500,
 
-            # Periodic info panel update interval (seconds)
-            'info_update_interval': 1.0,
+            # Debug
+            'trace': False,
         }
         self.display_config = {
             'show_path': False,
@@ -146,69 +147,50 @@ class MediaGraph:
         self._media_root_nodes = None
         self._DEBUG = False
 
-        # In-flight expansion de-dup across concurrent walks / open_node calls.
-        # IMPORTANT: This is distinct from "expanded"; it only prevents multiple
-        # concurrent expansions of the same node. Nodes can be expanded later.
+        # In-flight expansion de-dup across concurrent expansions of the same node.
         self._inflight = set()
         self._inflight_lock = None  # asyncio.Lock, initialized lazily
 
-        # NOTE: It might not be a great idea to collect all fields by default
-        # Things like CumulativeRunTimeTicks might require aggregation
         from jellyfin_apiclient_python.openapi._generated.models.item_fields import ItemFields
-        self.fields = set(ItemFields) - {
-            ItemFields.CUMULATIVERUNTIMETICKS,
-            ItemFields.RECURSIVEITEMCOUNT,
-            ItemFields.LOCALTRAILERCOUNT,
-            ItemFields.PEOPLE,
-        }
         self.fields = [ItemFields.PATH, ItemFields.GENRES, ItemFields.PARENTID]
 
     def _dbg(self, msg: str):
         if self._DEBUG:
             print(f'[MediaGraph] {msg}')
 
-    @classmethod
-    def _run_async(self, coro):
-        """Run an async coroutine, creating/managing an event loop if needed.
+    def _trace(self, event: str, **kw):
+        if not self.walk_config.get('trace', False):
+            return
+        rich.print(f"[dim]{event}[/dim] {ub.urepr(kw, nl=0)}")
 
-        - If no loop is running in this thread: uses ``asyncio.run``.
-        - If a loop is already running (e.g. Jupyter): runs the coroutine in a
-          dedicated background thread with its own event loop.
-        """
+    @classmethod
+    def _run_async(cls, coro):
+        """Run an async coroutine, creating/managing an event loop if needed."""
         import asyncio
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             return asyncio.run(coro)
 
-        # Running in an existing loop; create a new loop in a background thread.
         import threading
-
         result_box = {}
         error_box = {}
 
         def _thread_main():
             try:
                 result_box['result'] = asyncio.run(coro)
-            except Exception as ex:  # nocov
+            except Exception as ex:
                 error_box['error'] = ex
 
         t = threading.Thread(target=_thread_main, daemon=True)
         t.start()
         t.join()
-
         if 'error' in error_box:
             raise error_box['error']
         return result_box.get('result', None)
 
     @classmethod
     def ensure_demo_server(cls, reset: bool = False):
-        """
-        Ensure we have a demo Jellyfin server running for interactive use or tests.
-
-        - If reset=True, destroy any previous container and start fresh.
-        - Otherwise reuse an existing container for speed.
-        """
         from jellyfin_apiclient_python.demo import JellyfinDockerServer
         server = JellyfinDockerServer(reuse_container=not reset)
         server.start()
@@ -217,58 +199,36 @@ class MediaGraph:
 
     @classmethod
     def demo_client(cls):
-        """
-        Create a client for demos
-
-        Returns:
-            jellyfin_apiclient_python.JellyfinClient
-        """
-        # TODO: Ensure test environment can spin up a dummy jellyfin server.
         from jellyfin_apiclient_python.openapi.client import Jellyfin
         url = 'http://127.0.1.1:34907'
         username = 'jellyfin-user'
         password = 'jellyfin-pass'
-
-        url="http://192.168.222.38:8096"
-        username="jellyfin"
-        password=""
-
-        client = Jellyfin(
-            base_url=url,
-            username=username,
-            password=password,
-        )
+        client = Jellyfin(base_url=url, username=username, password=password)
         client.login()
         return client
 
+    # -------------------------
+    # Navigation / UI
+    # -------------------------
+
     def tree(self, max_depth=None):
-        """
-        Print the graph at the current working directory.
-        """
         if self._cwd is None:
             self.print_graph(max_depth=max_depth)
         else:
             self.print_graph(sources=[self._cwd], max_depth=max_depth)
 
     def ls(self):
-        """
-        List the children of the current working directory (node) in the graph.
-        """
         if self._cwd is None:
             return self._media_root_nodes
         else:
             return self._cwd_children
 
     def cd(self, node):
-        """
-        Change the cwd to a specific node, and add its children to the graph if
-        they have not already been.
-        """
         self._cwd = node
         if node is None:
             self._cwd_children = self._media_root_nodes
         else:
-            if not self.graph.nodes[node]['item']['IsFolder']:
+            if not self.graph.nodes[node]['item'].get('IsFolder', False):
                 raise Exception('can only cd into a folder')
             self.open_node(node, verbose=0)
             self._cwd_children = list(self.graph.succ[node])
@@ -277,17 +237,19 @@ class MediaGraph:
         self.open_node(node, verbose=1)
         return self
 
-    def setup(self):
-        """Populate the initial media folder graph.
+    # -------------------------
+    # Public setup / expansion
+    # -------------------------
 
-        This is a synchronous convenience wrapper that will create/manage its
-        own asyncio event loop when needed.
-        """
+    def setup(self):
         self._run_async(self.setup_async())
         self._update_graph_labels()
 
+    async def setup_async(self):
+        await self._init_media_folders_async()
+        return self
+
     def open_node(self, node, verbose=0, max_depth=1):
-        """Synchronously expand a node in the graph."""
         if self.graph is None:
             raise RuntimeError('MediaGraph.graph is not initialized; call setup() first')
 
@@ -309,10 +271,12 @@ class MediaGraph:
             'nondag_edge_types': ub.ddict(int),
             'total': 0,
             'latest_name': None,
+            'latest_path': None,
         }
-        pman = ub.ProgIter(desc='Open Node', verbose=verbose)
+
+        pman = _RichWalkProgress(enabled=True)
         with pman:
-            self._run_async(self._walk_node_async([item], pman, stats, max_depth=max_depth))
+            self._run_async(self._walk_node_async([item], pman, stats, max_depth=max_depth, root_bar=False))
         self._update_graph_labels(sources=[node_id])
 
         if verbose:
@@ -320,27 +284,13 @@ class MediaGraph:
             self.print_item(node)
         return self
 
-    async def setup_async(self):
-        """Async version of :meth:`setup`."""
-        await self._init_media_folders_async()
-        return self
-
-    def _init_media_folders(self):
-        """Synchronous wrapper for :meth:`_init_media_folders_async`."""
-        return self._run_async(self._init_media_folders_async())
+    # -------------------------
+    # Initialization
+    # -------------------------
 
     async def _init_media_folders_async(self):
-        """Initialize the graph with the user's top-level media folders and
-        optionally pre-walk them.
-
-        This aims to be faithful to the original synchronous implementation,
-        but uses the new OpenAPI client and supports async operation.
-        """
+        """Initialize graph with top-level media folders and optionally pre-walk them."""
         client = self.client
-
-        # Initialize graph
-        if self._DEBUG:
-            print('Initializing, clearing existing DiGraph')
         graph = nx.DiGraph()
         self.graph = graph
 
@@ -348,15 +298,12 @@ class MediaGraph:
         exclude_collection_types = self.walk_config.get('exclude_collection_types', None)
         initial_depth = self.walk_config['initial_depth']
 
-        if self._DEBUG:
-            print('Query top level media folder')
         resp = await client.api.library.get_media_folders.asyncio_detailed()
         assert resp.status_code == 200
         data = resp.parsed.to_dict()
 
         root_items = []
         root_node_ids = []
-
         stats = {
             'node_types': ub.ddict(int),
             'edge_types': ub.ddict(int),
@@ -366,20 +313,15 @@ class MediaGraph:
             'latest_path': None,
         }
 
-        # The /Library/MediaFolders endpoint may return either:
-        #   (A) actual library items directly in Items
-        #   (B) media-folder containers with a Children list of actual items
         for folder in data.get('Items', []):
             candidates = folder.get('Children') or [folder]
             for item in candidates:
-                # Normalize type / collection type and apply filters (orig behavior)
                 collection_type = item.get('CollectionType', folder.get('CollectionType', None))
                 if include_collection_types is not None and collection_type not in include_collection_types:
                     continue
                 if exclude_collection_types is not None and collection_type in exclude_collection_types:
                     continue
 
-                # Ensure the node exists
                 item_id = item['Id']
                 item['type'] = item.get('Type', item.get('type', None))
                 if item_id not in graph:
@@ -390,43 +332,32 @@ class MediaGraph:
 
         self._media_root_nodes = root_node_ids
 
-        # Pre-walk each media root (optional)
-        if self._DEBUG:
-            print('... top level scan complete, starting media folder walk.')
         pman = _RichWalkProgress(enabled=True)
         with pman:
-            # Root-level progress bar (always shown, even for small roots)
-            root_task = pman.add_task('Walk Media Folders', total=len(root_items))
-
             import asyncio
+            # Persistent top-level bar
+            root_task = pman.add_task('Walk Media Folders', total=len(root_items), transient=False)
+
             max_roots = int(self.walk_config.get('max_concurrent_root_walks', 3))
             root_sem = asyncio.Semaphore(max_roots)
 
             async def _walk_one_root(item):
                 async with root_sem:
-                    await self._walk_node_async([item], pman, stats, max_depth=initial_depth)
-                # Advance after the root walk completes (successfully)
+                    await self._walk_node_async([item], pman, stats, max_depth=initial_depth, root_bar=True)
+                # advance only when subtree complete (guaranteed by walker return)
                 pman.advance(root_task, 1)
 
             tasks = [asyncio.create_task(_walk_one_root(item)) for item in root_items]
-            # Bubble exceptions like the synchronous version: any failure aborts setup.
             await asyncio.gather(*tasks, return_exceptions=False)
-
-            pman.remove_task(root_task)
 
         return stats
 
-    async def _walk_node_async(self, roots, pman, stats, max_depth=None):
-        """Concurrent async walker that expands nodes using OpenAPI ``asyncio_detailed``.
+    # -------------------------
+    # Core async walk with subtree-completion progress (DAG-safe)
+    # -------------------------
 
-        Concurrency strategy:
-            * Process multiple parent folders concurrently (worker pool).
-            * For each parent, fetch remaining pagination pages concurrently.
-            * Apply graph mutations in the worker (single-threaded asyncio),
-              which is safe because graph ops are atomic in this thread.
-        """
+    async def _walk_node_async(self, roots, pman, stats, max_depth=None, root_bar=True):
         import asyncio
-        import typing
 
         graph = self.graph
         perquery_limit = self.walk_config['perquery_limit']
@@ -435,220 +366,363 @@ class MediaGraph:
         max_parents = int(self.walk_config.get('max_concurrent_parents', 10))
         page_prefetch = bool(self.walk_config.get('page_prefetch', True))
 
-        info_update_interval = float(self.walk_config.get('info_update_interval', 1.0))
-        min_progress_total = int(self.walk_config.get('min_progress_total', 200))
+        info_update_interval = float(self.walk_config.get('info_update_interval', 0.5))
+        large_threshold = int(self.walk_config.get('large_folder_threshold', 500))
 
         sem = asyncio.Semaphore(max_req)
 
-        # Adding UserViews creates duplicates, and collections can be huge / cyclic
+        # Behavior / pruning (same intent as before)
         type_add_blocklist = {'UserView', 'CollectionFolder'}
-        # Avoid recursing into media that doesn't have meaningful children
         type_recurse_blocklist = {'Audio', 'Episode'}
 
         fields = self._coerce_item_fields(self.fields)
 
-        class StackFrame(typing.NamedTuple):
+        class Frame(typing.NamedTuple):
             item: dict
             depth: int
             is_root: bool
+            parent_id: typing.Optional[str]
 
-        q: asyncio.Queue[StackFrame] = asyncio.Queue()
-        for _root in (roots if isinstance(roots, (list, tuple)) else [roots]):
-            await q.put(StackFrame(_root, 0, True))
+        q: asyncio.Queue[Frame] = asyncio.Queue()
 
-        # In-flight de-dup lock (async context)
+        roots_list = roots if isinstance(roots, (list, tuple)) else [roots]
+        for r in roots_list:
+            await q.put(Frame(r, 0, True, None))
+
+        # In-flight de-dup: prevents concurrent expand of same node
         if self._inflight_lock is None:
             self._inflight_lock = asyncio.Lock()
         inflight = self._inflight
         inflight_lock = self._inflight_lock
 
-        # Keep the info panel responsive without flooding refresh
+        # Progress / completion propagation
+        # meta[folder_id] = {
+        #   'pending_primary_folders': int,  # folders whose completion we are waiting for (only primary children)
+        #   'progress_task': task_id|None,  # transient per-folder bar
+        #   'parent_id': parent_id|None,    # primary parent for completion propagation
+        #   'is_root': bool,
+        #   'total_children': int,
+        # }
+        meta = {}
+        meta_lock = asyncio.Lock()
+
+        # child_folder_id -> primary_parent_id
+        primary_parent = {}
+        primary_lock = asyncio.Lock()
+
+        completed_folders = set()
+        completed_lock = asyncio.Lock()
+
         last_info_update = ub.Timer().tic()
 
-        async def fetch_all_children(parent, *, is_root=False):
-            """Fetch all children of a parent.
+        def should_recurse(item: dict) -> bool:
+            if not item.get('IsFolder', False):
+                return False
+            if item.get('Type') in type_recurse_blocklist:
+                return False
+            return True
 
-            Progress behavior:
-                * Always show a progress bar for root media folders.
-                * For non-root folders, only show a bar if TotalRecordCount is large
-                  (>= ``min_progress_total``).
-            """
-            parent_name = parent.get('Name', '<no-name>')
-            folder_task = None
-
+        async def fetch_children(parent_id: str):
+            parent_item = graph.nodes[parent_id]['item']
             first = await self._safe_user_items_async(
-                parent=parent, offset=0, perquery_limit=perquery_limit,
+                parent=parent_item, offset=0, perquery_limit=perquery_limit,
                 fields=fields, attempts=attempts, sem=sem,
             )
             items = list(first.get('Items', []))
-            total = first.get('TotalRecordCount', len(items))
+            total = int(first.get('TotalRecordCount', len(items)))
 
-            if pman is not None and (is_root or total >= min_progress_total):
-                folder_task = pman.add_task(f'Walk {parent_name}', total=total)
-                if items:
-                    pman.advance(folder_task, len(items))
-
-            if not page_prefetch:
+            if (not page_prefetch) or len(items) >= total:
                 offset = len(items)
                 while offset < total:
                     page = await self._safe_user_items_async(
-                        parent=parent, offset=offset, perquery_limit=perquery_limit,
+                        parent=parent_item, offset=offset, perquery_limit=perquery_limit,
                         fields=fields, attempts=attempts, sem=sem,
                     )
                     page_items = page.get('Items', [])
                     items.extend(page_items)
                     offset += len(page_items)
-                    if pman is not None and folder_task is not None and page_items:
-                        pman.advance(folder_task, len(page_items))
-                return items, total, folder_task
+                return items, total
 
-            # Fetch remaining pages concurrently and advance as they complete
             tasks = []
             offset = len(items)
             while offset < total:
-                tasks.append(asyncio.create_task(
-                    self._safe_user_items_async(
-                        parent=parent, offset=offset, perquery_limit=perquery_limit,
-                        fields=fields, attempts=attempts, sem=sem,
-                    )
-                ))
+                tasks.append(asyncio.create_task(self._safe_user_items_async(
+                    parent=parent_item, offset=offset, perquery_limit=perquery_limit,
+                    fields=fields, attempts=attempts, sem=sem,
+                )))
                 offset += perquery_limit
 
-            if tasks:
-                for fut in asyncio.as_completed(tasks):
-                    page = await fut
-                    page_items = page.get('Items', [])
-                    items.extend(page_items)
-                    if pman is not None and folder_task is not None and page_items:
-                        pman.advance(folder_task, len(page_items))
+            for fut in asyncio.as_completed(tasks):
+                page = await fut
+                items.extend(page.get('Items', []))
+            return items, total
 
-            return items, total, folder_task
+        def add_node_if_missing(child: dict):
+            cid = child['Id']
+            if cid not in graph.nodes:
+                graph.add_node(cid, item=child, properties=dict(expanded=False))
 
-        async def expand_parent(frame: StackFrame):
-            parent = frame.item
-            parent_id = parent['Id']
+        def add_edge(parent_id: str, child_id: str):
+            if not graph.has_edge(parent_id, child_id):
+                graph.add_edge(parent_id, child_id)
 
-            # Respect max_depth without poisoning future expansions
-            if max_depth is not None and frame.depth >= max_depth:
+        async def ensure_folder_task(node_id: str, total_children: int, is_root_folder: bool):
+            if pman is None:
+                return None
+            create = is_root_folder or (total_children >= large_threshold)
+            if not create:
+                return None
+            desc = graph.nodes[node_id]['item'].get('Name', '<no-name>')
+            return pman.add_task(f'Walk {desc}', total=total_children, transient=True)
+
+        async def advance_folder_task(folder_id: str, n: int):
+            if pman is None:
+                return
+            async with meta_lock:
+                task_id = meta.get(folder_id, {}).get('progress_task', None)
+            if task_id is not None and n:
+                pman.advance(task_id, n)
+
+        async def maybe_finish_folder(folder_id: str):
+            """
+            If folder_id has no pending primary child folders, mark it complete and propagate completion
+            upward (advance parent by 1 if parent is waiting on this as a primary child).
+            """
+            async with meta_lock:
+                m = meta.get(folder_id, None)
+                if m is None:
+                    return
+                pending = m['pending_primary_folders']
+                parent_id = m['parent_id']
+                task_id = m['progress_task']
+
+            if pending != 0:
                 return
 
-            node_data = graph.nodes[parent_id]
-            node_data['properties']['expanded'] = True
+            async with completed_lock:
+                if folder_id in completed_folders:
+                    return
+                completed_folders.add(folder_id)
 
-            stats['latest_name'] = parent.get('Name', None)
-            stats['latest_path'] = parent.get('Path', None)
+            # Ensure its own bar is at 100% (it should be, but guard against logic slips)
+            if pman is not None and task_id is not None:
+                # Best-effort: set completed=total if needed
+                try:
+                    # rich doesn't expose "set to total" cleanly, but update(completed=total) works.
+                    async with meta_lock:
+                        total = meta.get(folder_id, {}).get('total_children', None)
+                    if total is not None:
+                        pman.update(task_id, completed=total)
+                except Exception:
+                    pass
 
-            folder_task = None
+                # mark task as gone so nobody tries to update it later
+                async with meta_lock:
+                    if folder_id in meta:
+                        meta[folder_id]['progress_task'] = None
 
-            # Special features for Series/Season
-            if parent.get('Type') in {'Series', 'Season'}:
+                # then remove it from rich
+                if pman is not None and task_id is not None:
+                    pman.remove_task(task_id)
+
+            # Propagate completion to primary parent (if any)
+            if parent_id is not None:
+                await advance_folder_task(parent_id, 1)
+                async with meta_lock:
+                    if parent_id in meta:
+                        meta[parent_id]['pending_primary_folders'] -= 1
+                await maybe_finish_folder(parent_id)
+
+        async def expand_folder(frame: Frame):
+            parent_item = frame.item
+            parent_id = parent_item['Id']
+
+            # If we won't expand due to max_depth, treat as completed unit for its parent if needed.
+            if max_depth is not None and frame.depth >= max_depth:
+                if frame.parent_id is not None:
+                    # This frame represents a child folder that was counted as primary pending by its parent.
+                    await advance_folder_task(frame.parent_id, 1)
+                    async with meta_lock:
+                        if frame.parent_id in meta:
+                            meta[frame.parent_id]['pending_primary_folders'] -= 1
+                    await maybe_finish_folder(frame.parent_id)
+                return
+
+            # Mark expanded in graph
+            graph.nodes[parent_id]['properties']['expanded'] = True
+
+            stats['latest_name'] = parent_item.get('Name', None)
+            stats['latest_path'] = parent_item.get('Path', None)
+
+            # Special features for Series/Season (same as prior)
+            if parent_item.get('Type') in {'Series', 'Season'}:
                 special_features = await self._special_features_async(parent_id, sem=sem)
                 if special_features:
                     special_features_id = parent_id + '/SpecialFeatures'
-                    special_parent = {
-                        'Name': 'Special Features',
-                        'Id': special_features_id,
-                        'Type': 'SpecialFeatures',
-                    }
+                    special_parent = {'Name': 'Special Features', 'Id': special_features_id, 'Type': 'SpecialFeatures'}
                     if special_parent['Id'] not in graph:
                         graph.add_node(special_parent['Id'], item=special_parent, properties=dict(expanded=True))
+                        stats['node_types'][special_parent['Type']] += 1
                     if not graph.has_edge(parent_id, special_parent['Id']):
                         graph.add_edge(parent_id, special_parent['Id'])
-                    stats['edge_types'][(parent.get('Type'), special_parent['Type'])] += 1
+                        stats['edge_types'][(parent_item.get('Type'), special_parent['Type'])] += 1
                     for special in special_features:
-                        stats['edge_types'][('SpecialFeatures', special.get('Type'))] += 1
                         if special['Id'] not in graph:
                             graph.add_node(special['Id'], item=special, properties=dict(expanded=False))
+                            stats['node_types'][special.get('Type')] += 1
                         if not graph.has_edge(special_parent['Id'], special['Id']):
                             graph.add_edge(special_parent['Id'], special['Id'])
+                            stats['edge_types'][('SpecialFeatures', special.get('Type'))] += 1
 
-            children_items, _total, folder_task = await fetch_all_children(parent, is_root=frame.is_root)
+            # Fetch direct children
+            children, total_children = await fetch_children(parent_id)
 
-            for child in children_items:
+            # Ensure meta entry and transient bar creation
+            is_root_folder = frame.is_root
+            task_id = await ensure_folder_task(parent_id, total_children, is_root_folder=is_root_folder)
+
+            async with meta_lock:
+                meta[parent_id] = {
+                    'pending_primary_folders': 0,
+                    'progress_task': task_id,
+                    'parent_id': frame.parent_id,
+                    'is_root': is_root_folder,
+                    'total_children': total_children,
+                }
+
+            # Process direct children in a way that guarantees EXACTLY total_children progress units.
+            immediate_units = 0
+            primary_pending = 0
+
+            for child in children:
                 cid = child['Id']
+                ctype = child.get('Type')
+                ptype = parent_item.get('Type')
 
-                # Node already exists (possibly reached via another path).
-                # Still add the edge.
+                # Always count this direct child as "processed" for progress totals
+                # (either immediate or later via primary subtree completion).
+                if ctype in type_add_blocklist:
+                    # Skipped from graph, but counts immediately for progress.
+                    immediate_units += 1
+                    continue
+
+                # Graph: add nodes/edges, and update stats
                 if cid in graph.nodes:
-                    stats['nondag_edge_types'][(parent.get('Type'), child.get('Type'))] += 1
-                    if not graph.has_edge(parent_id, cid):
-                        graph.add_edge(parent_id, cid)
-                    if child.get('IsFolder') and child.get('Type') not in type_recurse_blocklist:
-                        await q.put(StackFrame(child, frame.depth + 1, False))
-                    continue
+                    stats['nondag_edge_types'][(ptype, ctype)] += 1
+                    add_edge(parent_id, cid)
+                else:
+                    add_node_if_missing(child)
+                    add_edge(parent_id, cid)
+                    stats['node_types'][ctype] += 1
+                    stats['edge_types'][(ptype, ctype)] += 1
 
-                if child.get('Type') in type_add_blocklist:
-                    continue
+                # Decide recursion and progress attribution
+                if should_recurse(child):
+                    # If this child folder is already fully completed, parent gets immediate unit.
+                    async with completed_lock:
+                        already_completed = cid in completed_folders
+                    if already_completed:
+                        immediate_units += 1
+                        continue
 
-                stats['edge_types'][(parent.get('Type'), child.get('Type'))] += 1
-                stats['node_types'][child.get('Type')] += 1
+                    # Primary-parent ownership: only the primary parent waits for subtree completion.
+                    async with primary_lock:
+                        existing_parent = primary_parent.get(cid, None)
+                        if existing_parent is None:
+                            primary_parent[cid] = parent_id
+                            owned_by_me = True
+                        else:
+                            owned_by_me = (existing_parent == parent_id)
 
-                graph.add_node(cid, item=child, properties=dict(expanded=False))
-                graph.add_edge(parent_id, cid)
+                    if owned_by_me:
+                        primary_pending += 1
+                        await q.put(Frame(child, frame.depth + 1, False, parent_id))
+                    else:
+                        # Not my primary child: count immediately so my bar can still reach 100%.
+                        immediate_units += 1
+                else:
+                    immediate_units += 1
 
-                # Queue child folders for expansion
-                if child.get('IsFolder') and child.get('Type') not in type_recurse_blocklist:
-                    await q.put(StackFrame(child, frame.depth + 1, False))
+            # Apply progress + pending counts
+            if immediate_units:
+                await advance_folder_task(parent_id, immediate_units)
 
-            stats['total'] += len(children_items)
+            async with meta_lock:
+                if parent_id in meta:
+                    meta[parent_id]['pending_primary_folders'] = primary_pending
 
-            if pman is not None and folder_task is not None:
-                pman.remove_task(folder_task)
+            # Stats total = discovered direct children (same spirit as before)
+            stats['total'] += len(children)
+
+            # This folder might finish immediately if no pending primary folders
+            await maybe_finish_folder(parent_id)
 
             # Periodic info update
-            if pman is not None:
-                if last_info_update.toc() > info_update_interval:
-                    pman.update_info(ub.urepr(stats))
-                    last_info_update.tic()
+            if pman is not None and last_info_update.toc() > info_update_interval:
+                async with meta_lock:
+                    pending_folders = sum(v.get('pending_primary_folders', 0) for v in meta.values())
+                    active_folders = sum(1 for v in meta.values() if v.get('pending_primary_folders', 0) > 0)
+                info = {
+                    'latest_name': stats.get('latest_name'),
+                    'latest_path': stats.get('latest_path'),
+                    'total_items_seen': stats.get('total', 0),
+                    'pending_primary_folders_sum': pending_folders,
+                    'active_folders': active_folders,
+                    'queue': q.qsize(),
+                    'node_types': dict(stats['node_types']),
+                    'edge_types': dict(stats['edge_types']),
+                    'nondag_edge_types': dict(stats['nondag_edge_types']),
+                }
+                pman.update_info(ub.urepr(info, nl=2))
+                last_info_update.tic()
 
         async def worker(worker_id: int):
             while True:
                 frame = await q.get()
                 pid = frame.item['Id']
                 try:
-                    # Fast skip if already expanded
+                    # If already expanded, then if it is also completed, a waiting parent may need credit.
                     try:
                         if graph.nodes[pid]['properties'].get('expanded', False):
+                            # If already completed, its parent (if waiting as primary) should get credit.
+                            async with completed_lock:
+                                done = pid in completed_folders
+                            if done and frame.parent_id is not None:
+                                await advance_folder_task(frame.parent_id, 1)
+                                async with meta_lock:
+                                    if frame.parent_id in meta:
+                                        meta[frame.parent_id]['pending_primary_folders'] -= 1
+                                await maybe_finish_folder(frame.parent_id)
                             continue
                     except KeyError:
-                        # Node should exist, but if not, don't crash workers
                         continue
 
-                    # Respect max_depth early (and don't "reserve" inflight)
-                    if max_depth is not None and frame.depth >= max_depth:
-                        continue
-
-                    # In-flight de-dup: only one worker should expand a node at a time.
+                    # In-flight de-dup: only one worker expands a given node at a time.
                     async with inflight_lock:
                         if pid in inflight:
+                            # Another worker is doing it; do NOT decrement parent's pending here,
+                            # because this frame represents a primary wait, and completion will
+                            # propagate when the expander finishes (via meta[parent_id]).
                             continue
-                        # It might have been expanded while waiting for the lock
                         if graph.nodes[pid]['properties'].get('expanded', False):
                             continue
                         inflight.add(pid)
 
                     try:
-                        await expand_parent(frame)
+                        await expand_folder(frame)
                     finally:
                         async with inflight_lock:
                             inflight.discard(pid)
-
                 finally:
                     q.task_done()
 
-        if self._DEBUG:
-            print('... start async workers')
         workers = [asyncio.create_task(worker(i)) for i in range(max_parents)]
-        if self._DEBUG:
-            print(f'workers={workers}')
 
         try:
             await q.join()
         finally:
-            # Always cancel workers once the queue is done (or if something errors)
             for w in workers:
                 w.cancel()
-            # Await workers so any exception inside them is re-raised here
             results = await asyncio.gather(*workers, return_exceptions=True)
             for r in results:
                 if isinstance(r, asyncio.CancelledError):
@@ -656,11 +730,30 @@ class MediaGraph:
                 if isinstance(r, BaseException):
                     raise r
 
-        if self._DEBUG:
-            print(f'stats={stats}')
+        # Final guard: force completion checks for roots
+        for r in roots_list:
+            await maybe_finish_folder(r['Id'])
+
+        # Final guard: if any remaining transient tasks exist, force them to 100 and remove.
+        # This should be a no-op in correct operation, but it prevents UI "hanging" even if
+        # a rare edge case slipped through.
+        if pman is not None:
+            async with meta_lock:
+                leftovers = list(meta.items())
+            for fid, m in leftovers:
+                task_id = m.get('progress_task', None)
+                if task_id is None:
+                    continue
+                total = m.get('total_children', None)
+                if total is not None:
+                    pman.update(task_id, completed=total)
+                pman.remove_task(task_id)
+
+    # -------------------------
+    # Network calls
+    # -------------------------
 
     async def _safe_user_items_async(self, parent, offset, perquery_limit, fields, attempts=1, verbose=False, sem=None):
-        """Async version of :meth:`_safe_user_items` using OpenAPI ``asyncio_detailed``."""
         import asyncio
         import traceback
 
@@ -668,45 +761,34 @@ class MediaGraph:
         parent_id = parent['Id']
         parent_name = parent.get('Name', '<no-name>')
         parent_path = parent.get('Path', None)
-        total_record_count = parent.get('TotalRecordCount', None)
-
-        if self._DEBUG:
-            print(f'Issue query {parent_id=} {offset=} {total_record_count=}: {parent_name=}')
 
         last_err = None
         for attempt in range(1, attempts + 1):
             try:
+                kwargs = {
+                    'parent_id': parent_id,
+                    'recursive': False,
+                    'fields': fields,
+                    'limit': perquery_limit,
+                    'start_index': offset,
+                }
+                user_id = getattr(client, 'user_id', None)
+                if user_id is not None:
+                    kwargs['user_id'] = user_id
+
                 if sem is None:
-                    kwargs = {
-                        'parent_id': parent_id,
-                        'recursive': False,
-                        'fields': fields,
-                        'limit': perquery_limit,
-                        'start_index': offset,
-                    }
-                    user_id = getattr(client, 'user_id', None)
-                    if user_id is not None:
-                        kwargs['user_id'] = user_id
                     resp = await client.api.items.get_items.asyncio_detailed(**kwargs)
                 else:
                     async with sem:
-                        kwargs = {
-                            'parent_id': parent_id,
-                            'recursive': False,
-                            'fields': fields,
-                            'limit': perquery_limit,
-                            'start_index': offset,
-                        }
-                        user_id = getattr(client, 'user_id', None)
-                        if user_id is not None:
-                            kwargs['user_id'] = user_id
                         resp = await client.api.items.get_items.asyncio_detailed(**kwargs)
+
                 assert resp.status_code == 200
                 return resp.parsed.to_dict()
-            except Exception as err:  # nocov
+
+            except Exception as err:
                 last_err = err
                 print(
-                    f'[MediaGraph] user_items_async failed (attempt {attempt}/{attempts}) '
+                    f'[MediaGraph] get_items failed (attempt {attempt}/{attempts}) '
                     f'parent={parent_name!r} id={parent_id} path={parent_path!r} '
                     f'offset={offset} limit={perquery_limit} err={type(err).__name__}: {err}'
                 )
@@ -719,7 +801,6 @@ class MediaGraph:
         ) from last_err
 
     async def _special_features_async(self, item_id, sem=None):
-        """Fetch special features for a Series/Season."""
         client = self.client
         if sem is None:
             resp = await client.api.user_library.get_special_features.asyncio_detailed(item_id=item_id)
@@ -730,13 +811,9 @@ class MediaGraph:
         return [f.to_dict() for f in resp.parsed]
 
     def _coerce_item_fields(self, fields):
-        """
-        Normalize field requests into a list of ItemFields / strings.
-        """
         from jellyfin_apiclient_python.openapi._generated.models.item_fields import ItemFields
         if fields is None:
             return None
-
         if isinstance(fields, str):
             if ',' in fields:
                 fields = [f.strip() for f in fields.split(',') if f.strip()]
@@ -757,6 +834,10 @@ class MediaGraph:
                 continue
         return coerced
 
+    # -------------------------
+    # Labels (UNCHANGED)
+    # -------------------------
+
     def _update_graph_labels(self, sources=None):
         """
         Update the rich text representation of select items in the graph.
@@ -774,8 +855,6 @@ class MediaGraph:
         }
 
         url = self.client.base_url
-        # http.config.data['auth.server']
-
         graph = self.graph
 
         reachable_nodes = reachable(graph, sources)
@@ -828,7 +907,6 @@ class MediaGraph:
             if self.display_config['show_path']:
                 if path is not None:
                     namerep = item['Name'] + ' - ' + path
-                    # namerep = path
 
             item_id_link = f'{url}/web/index.html#!/details?id={item["Id"]}'
             item_id_rep = item["Id"]
@@ -837,17 +915,14 @@ class MediaGraph:
             label = f'{color_part1} {item_id_rep} : {type_glyph} {item["Type"]} - {namerep} {color_part2}'
             node_data['label'] = label
 
+    # -------------------------
+    # Printing / searching
+    # -------------------------
+
     def print(self):
-        """
-        Alias for :func:`MediaGraph.print_graph`.
-        """
         self.print_graph()
 
     def print_graph(self, sources=None, max_depth=None):
-        """
-        Prints the current state of the media graph to stdout at a particular
-        starting point with a specified depth.
-        """
         nx.write_network_text(self.graph, path=rich.print, end='', sources=sources, max_depth=max_depth)
 
     def print_item(self, node):
@@ -859,20 +934,6 @@ class MediaGraph:
         rprint(f'item = {ub.urepr(item, nl=1)}')
 
     def find(self, pattern, data=False, root=None):
-        """
-        Search for a pattern within the current directory.
-
-        Args:
-            pattern (str): text to find in the media name.
-            data (bool): if True, also return the data dict
-            root (str | None): if specified search from this location,
-                if unspecified the cwd is used.
-
-        Yields:
-            str | Tuple[str, dict]:
-                the id of the found item, or the id and its data if
-                data=True
-        """
         import networkx as nx
         if root is None:
             root = self._cwd
@@ -885,8 +946,6 @@ class MediaGraph:
             node_data = graph.nodes[node]
             item = node_data['item']
             name = item['Name']
-            # TODO: allow multiple types of patterns (i.e. similar to
-            # kwutil.Pattern) to abstract regex, glob, and raw string matching.
             if pattern in name:
                 if data:
                     yield node, node_data
@@ -894,33 +953,11 @@ class MediaGraph:
                     yield node
 
     def find_one(self, pattern, data=False, root=None):
-        """
-        Find exactly one item matching a pattern.
-
-        Args:
-            pattern (str): text to find in the media name.
-            data (bool): if True, also return the data dict.
-            root (str | None): if specified search from this location,
-                if unspecified the cwd is used.
-
-        Returns:
-            str | Tuple[str, dict]:
-                the unique matching item.
-
-        Raises:
-            KeyError:
-                if no items match or if multiple items match.
-        """
         matches = list(self.find(pattern, data=data, root=root))
-
         if not matches:
             raise KeyError(f'find_one({pattern!r}) found no matches')
-
         if len(matches) > 1:
-            raise KeyError(
-                f'find_one({pattern!r}) found {len(matches)} matches, expected exactly one'
-            )
-
+            raise KeyError(f'find_one({pattern!r}) found {len(matches)} matches, expected exactly one')
         return matches[0]
 
 
@@ -928,6 +965,7 @@ def reachable(graph, sources=None):
     if sources is None:
         yield from graph.nodes
     else:
+        import networkx as nx
         seen = set()
         for source in sources:
             if source in seen:
@@ -935,44 +973,6 @@ def reachable(graph, sources=None):
             for node in nx.dfs_preorder_nodes(graph, source):
                 seen.add(node)
                 yield node
-
-
-def _find_sources(graph):
-    """
-    Determine a minimal set of nodes such that the entire graph is reachable
-    """
-    import networkx as nx
-    # For each connected part of the graph, choose at least
-    # one node as a starting point, preferably without a parent
-    if graph.is_directed():
-        # Choose one node from each SCC with minimum in_degree
-        sccs = list(nx.strongly_connected_components(graph))
-        # condensing the SCCs forms a dag, the nodes in this graph with
-        # 0 in-degree correspond to the SCCs from which the minimum set
-        # of nodes from which all other nodes can be reached.
-        scc_graph = nx.condensation(graph, sccs)
-        supernode_to_nodes = {sn: [] for sn in scc_graph.nodes()}
-        # Note: the order of mapping differs between pypy and cpython
-        # so we have to loop over graph nodes for consistency
-        mapping = scc_graph.graph["mapping"]
-        for n in graph.nodes:
-            sn = mapping[n]
-            supernode_to_nodes[sn].append(n)
-        sources = []
-        for sn in scc_graph.nodes():
-            if scc_graph.in_degree[sn] == 0:
-                scc = supernode_to_nodes[sn]
-                node = min(scc, key=lambda n: graph.in_degree[n])
-                sources.append(node)
-    else:
-        # For undirected graph, the entire graph will be reachable as
-        # long as we consider one node from every connected component
-        sources = [
-            min(cc, key=lambda n: graph.degree[n])
-            for cc in nx.connected_components(graph)
-        ]
-        sources = sorted(sources, key=lambda n: graph.degree[n])
-    return sources
 
 
 def rprint(*args):
@@ -984,11 +984,7 @@ def rprint(*args):
 
 
 class _RichWalkProgress:
-    """Standalone rich progress + info panel for async MediaGraph walking.
-
-    Designed to resemble progiter.manager rich backend style, but without
-    progiter, so async code can directly manage per-node tasks.
-    """
+    """Rich progress manager with optional transient tasks and an info panel."""
     def __init__(self, enabled=True):
         self.enabled = enabled
         self._active = False
@@ -996,6 +992,7 @@ class _RichWalkProgress:
         self.progress = None
         self.live = None
         self.group = None
+        self._Panel = None
         self._setup()
 
     def _setup(self):
@@ -1007,7 +1004,6 @@ class _RichWalkProgress:
         import rich.progress as rich_progress
 
         class ProgressRateColumn(ProgressColumn):
-            """Shows iterations / second."""
             def render(self, task) -> Text:
                 itps = task.finished_speed or task.speed
                 if itps is not None:
@@ -1030,10 +1026,10 @@ class _RichWalkProgress:
             rich_progress.TimeRemainingColumn(),
             'total',
             rich_progress.TimeElapsedColumn(),
+            transient=False,
         )
-        self.info_panel = None
         self.group = Group(self.progress)
-        self.live = Live(self.group)
+        self.live = Live(self.group, refresh_per_second=20)
 
     def __enter__(self):
         self.start()
@@ -1054,29 +1050,44 @@ class _RichWalkProgress:
             self.live.__exit__(**kw)
             self._active = False
 
-    def add_task(self, desc, total=None):
+    def add_task(self, desc, total=None, transient=True):
         if not self.enabled:
             return None
-        return self.progress.add_task(description=desc, total=total)
+        task_id = self.progress.add_task(description=desc, total=total)
+        return task_id
 
     def update(self, task_id, **kw):
-        if self.enabled and task_id is not None:
+        if not (self.enabled and task_id is not None):
+            return
+        try:
             self.progress.update(task_id, **kw)
+        except KeyError:
+            # task already removed; ignore
+            return
 
     def advance(self, task_id, n=1):
-        if self.enabled and task_id is not None:
+        if not (self.enabled and task_id is not None):
+            return
+        try:
             self.progress.update(task_id, advance=n)
+        except KeyError:
+            return
 
     def remove_task(self, task_id):
-        if self.enabled and task_id is not None:
+        if not (self.enabled and task_id is not None):
+            return
+        try:
             self.progress.remove_task(task_id)
+        except KeyError:
+            return
+
 
     def update_info(self, text):
         if not self.enabled:
             return
         if self.info_panel is None:
             self.info_panel = self._Panel(text)
-            # Insert above progress bars
             self.group.renderables.insert(0, self.info_panel)
         else:
             self.info_panel.renderable = text
+

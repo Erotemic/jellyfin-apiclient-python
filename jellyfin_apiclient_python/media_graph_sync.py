@@ -141,9 +141,9 @@ class MediaGraphSync:
         # TODO: Ensure test environment can spin up a dummy jellyfin server.
         from jellyfin_apiclient_python.openapi.client import Jellyfin
 
-        url="http://192.168.222.38:8096"
-        username="jellyfin"
-        password=""
+        url = 'http://127.0.1.1:34907'
+        username = 'jellyfin-user'
+        password = 'jellyfin-pass'
 
         client = Jellyfin(
             base_url=url,
